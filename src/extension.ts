@@ -72,16 +72,24 @@ function updateDecorations(
     service: Service,
     configuration: Configuration
 ): void {
-    let isIncomplete = false;
+    let isSomethingIncomplete = false;
     const visibleTextEditors = vscode.window.visibleTextEditors.filter(isSupportedLanguage);
     for (const visibleTextEditor of visibleTextEditors) {
-        const fileName = visibleTextEditor.document.fileName;
-        const decorations = service.getDecorations(normalizeFileName(fileName));
-         isIncomplete = isIncomplete || decorations.some(d => d.isIncomplete)
-        const decorationOptions = decorations.reduce<vscode.DecorationOptions[]>((arr, d) => arr.concat(createDecorationOptions(d, configuration)), []);
-        visibleTextEditor.setDecorations(decorationType, decorationOptions);
+        const fileName = normalizeFileName(visibleTextEditor.document.fileName);
+        if (service.isUpToDate(fileName)) {
+            const decorations = service.getDecorations(fileName);
+            const isIncomplete = decorations.some(d => d.isIncomplete);
+            isSomethingIncomplete = isSomethingIncomplete || isIncomplete;
+            if (configuration.features.showIncompleteInfo || !isIncomplete) {
+                const decorationOptions: vscode.DecorationOptions[] = [];
+                for (const d of decorations) {
+                    decorationOptions.push(...createDecorationOptions(d, configuration));
+                }
+                visibleTextEditor.setDecorations(decorationType, decorationOptions);
+            }
+        }
     }
-    if(isIncomplete) {
+    if (isSomethingIncomplete) {
         setTimeout(() => updateDecorations(decorationType, service, configuration), configuration.updateDelay);
     }
 }

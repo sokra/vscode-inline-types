@@ -11,8 +11,10 @@ interface ServiceContext {
     readonly configuration: Configuration;
     readonly sourceFilesCache: Map<string, ts.SourceFile>;
     readonly updateProgram: () => void;
+    readonly updateParsedCommandLine: () => void;
     readonly getCommittedSourceFilesCache: () => Map<string, ts.SourceFile>;
     readonly getProgram: () => ts.Program;
+    readonly getParsedCommandLine: () => ts.ParsedCommandLine;
     readonly getOptions: () => ts.CompilerOptions;
     readonly getTypeChecker: () => ts.TypeChecker;
     readonly getRootFileNames: () => ReadonlyArray<string>;
@@ -26,9 +28,10 @@ export function createService(
     const context = createServiceContext(
         rootPath,
         configuration,
-        getDelayedOnUpdate(configuration.updateDelay, onUpdate));
+        onUpdate);
 
     return {
+        isUpToDate: curry(isUpToDate, context),
         getDecorations: curry(getDecorations, context),
         notifyFileChange: curry(notifyFileChange, context),
         notifyDocumentChange: curry(notifyDocumentChange, context)
@@ -55,19 +58,25 @@ function createServiceContext(
 ): ServiceContext {
     const sourceFilesCache = new Map<string, ts.SourceFile>();
     let committedSourceFilesCache = new Map<string, ts.SourceFile>();
-    let program: ts.Program = createProgram(rootPath, committedSourceFilesCache, sourceFilesCache);
+    let parsedCommandLine = getParsedCommandLine(rootPath);
+    let program: ts.Program = createProgram(parsedCommandLine, committedSourceFilesCache, sourceFilesCache);
     const context: ServiceContext = {
         rootPath,
         configuration,
         sourceFilesCache,
         updateProgram: getDelayedOnUpdate(
-            configuration.compileDelay, 
+            configuration.updateDelay,
             () => {
-                ts.createSourceFile
                 committedSourceFilesCache = new Map<string, ts.SourceFile>(context.sourceFilesCache);
-                updateProgram(() => context, newProgram => program = newProgram, onUpdate);
+                program = createProgram(parsedCommandLine, committedSourceFilesCache, sourceFilesCache, program);
+                onUpdate();
             }
         ),
+        updateParsedCommandLine: getDelayedOnUpdate(configuration.updateDelay, () => {
+            parsedCommandLine = getParsedCommandLine(rootPath);
+            context.updateProgram();
+        }),
+        getParsedCommandLine: () => parsedCommandLine,
         getCommittedSourceFilesCache: () => committedSourceFilesCache,
         getProgram: () => program,
         getOptions: () => program.getCompilerOptions(),
@@ -77,27 +86,16 @@ function createServiceContext(
     return context;
 }
 
-function createProgram(rootPath: string, committedSourceFilesCache: Map<string, ts.SourceFile>, sourceFilesCache: Map<string, ts.SourceFile>, oldProgram?: ts.Program): ts.Program {
-    const { fileNames, options } = getParsedCommandLine(rootPath);
+function createProgram(parsedCommandLine: ts.ParsedCommandLine, committedSourceFilesCache: Map<string, ts.SourceFile>, sourceFilesCache: Map<string, ts.SourceFile>, oldProgram?: ts.Program): ts.Program {
+    const { fileNames, options } = parsedCommandLine;
     const compilerHost = createCompilerHost(options, committedSourceFilesCache, sourceFilesCache);
     const program = ts.createProgram(fileNames, options, compilerHost, oldProgram);
     return program;
 }
 
-function updateProgram(
-    getContext: () => ServiceContext,
-    setProgram: (newProgram: ts.Program) => void,
-    onUpdate: () => void
-): void {
-    const context = getContext();
-    const program = createProgram(context.rootPath, context.getCommittedSourceFilesCache(), context.sourceFilesCache, context.getProgram());
-    setProgram(program);
-    onUpdate();
-}
-
 let queue: Set<() => void> | undefined = undefined;
 function queueWork(fn: () => void): void {
-    if(queue === undefined) {
+    if (queue === undefined) {
         queue = new Set([fn]);
         processQueue();
     } else {
@@ -107,16 +105,16 @@ function queueWork(fn: () => void): void {
 
 function processQueue(): void {
     setTimeout(() => {
-        if(queue === undefined) return;
-        if(queue.size === 0) {
+        if (queue === undefined) return;
+        if (queue.size === 0) {
             queue = undefined;
             return;
         }
         const start = Date.now();
-        for(const item of queue) {
+        for (const item of queue) {
             item();
             queue.delete(item);
-            if(Date.now() - start > 100) {
+            if (Date.now() - start > 100) {
                 break;
             }
         }
@@ -124,53 +122,91 @@ function processQueue(): void {
     }, 0);
 }
 
-const INCOMPLETE_TYPE = Symbol("incomplete") as unknown as ts.Type;
+const INCOMPLETE_TYPE = Symbol("incomplete");
+const INCOMPLETE_SIGNATURE = Symbol("incomplete");
 const INCOMPLETE_TYPENAME = "...";
 
-const typeAtLocationCache = new WeakMap<ts.Node, ts.Type>();
-function getTypeAtLocation(typeChecker: ts.TypeChecker, node: ts.Node): ts.Type {
-    const cacheEntry = typeAtLocationCache.get(node);
-    if(cacheEntry !== undefined) return cacheEntry;
-    queueWork(() => {
-        typeAtLocationCache.set(node, typeChecker.getTypeAtLocation(node));
-    });
-    return INCOMPLETE_TYPE;
+function createQueuedCacheMethod<T extends Object, Args extends any[], R, I, E>(fn: (typeChecker: ts.TypeChecker, value: T, ...args: Args) => R, incompleteResult: I, errorResult: E) {
+    const outerCache = new WeakMap<ts.TypeChecker, {
+        cache: WeakMap<T, [R | E]>,
+        inProgress: WeakSet<T>
+    }>();
+
+    function getEntry(typeChecker: ts.TypeChecker) {
+        let entry = outerCache.get(typeChecker);
+        if (entry !== undefined) return entry;
+        const newEntry = {
+            cache: new WeakMap<T, [R | E]>(),
+            inProgress: new WeakSet<T>()
+        }
+        outerCache.set(typeChecker, newEntry);
+        return newEntry;
+    }
+
+    return (typeChecker: ts.TypeChecker, value: T, ...args: Args): R | E | I => {
+        if (typeof value === "object" && value !== null) {
+            const { cache, inProgress } = getEntry(typeChecker);
+            const cacheEntry: [R | E] | undefined = cache.get(value);
+            if (cacheEntry !== undefined) return cacheEntry[0];
+            if (!inProgress.has(value)) {
+                inProgress.add(value);
+                queueWork(() => {
+                    try {
+                        cache!.set(value, [fn(typeChecker, value, ...args)]);
+                    } catch (e) {
+                        cache!.set(value, [errorResult]);
+                    }
+                });
+            }
+            return incompleteResult;
+        } else {
+            try {
+                return fn(typeChecker, value, ...args);
+            } catch (e) {
+                return errorResult;
+            }
+        }
+    }
 }
 
-const typeNameCache = new WeakMap<ts.Type, string>();
-function getShortTypeName(typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node): string {
-    let typeName = typeNameCache.get(type);
-    if (typeName !== undefined) return typeName;
-    queueWork(() => {
-        typeNameCache.set(type, typeChecker.typeToString(
-            type,
-            enclosingDeclaration,
-            ts.TypeFormatFlags.WriteArrowStyleSignature |
-            ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope
-        ));
-    });
-    return INCOMPLETE_TYPENAME;
-}
+const getTypeAtLocation = createQueuedCacheMethod((typeChecker: ts.TypeChecker, node: ts.Node) => typeChecker.getTypeAtLocation(node), INCOMPLETE_TYPE, null);
+const getReturnType = createQueuedCacheMethod(
+    (_typeChecker: ts.TypeChecker, signature: ts.Signature | typeof INCOMPLETE_SIGNATURE) => signature === INCOMPLETE_SIGNATURE ? INCOMPLETE_TYPE : signature.getReturnType(),
+    INCOMPLETE_TYPE,
+    null
+);
+const getResolvedSignature = createQueuedCacheMethod((typeChecker: ts.TypeChecker, node: ts.CallLikeExpression) => typeChecker.getResolvedSignature(node), INCOMPLETE_SIGNATURE, null);
+const getSignatureFromDeclaration = createQueuedCacheMethod((typeChecker: ts.TypeChecker, node: ts.SignatureDeclaration) => typeChecker.getSignatureFromDeclaration(node), INCOMPLETE_SIGNATURE, null);
+const getShortTypeName = createQueuedCacheMethod((typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node) => typeChecker.typeToString(
+    type,
+    enclosingDeclaration,
+    ts.TypeFormatFlags.WriteArrowStyleSignature |
+    ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope
+), INCOMPLETE_TYPENAME, "ERROR");
+const getLongTypeName = createQueuedCacheMethod(
+    (typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node) => typeChecker.typeToString(
+        type,
+        enclosingDeclaration,
+        ts.TypeFormatFlags.UseFullyQualifiedType |
+        ts.TypeFormatFlags.NoTruncation |
+        ts.TypeFormatFlags.UseStructuralFallback |
+        ts.TypeFormatFlags.AllowUniqueESSymbolType |
+        ts.TypeFormatFlags.WriteArrowStyleSignature |
+        ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
+    ).replace(/;(\s(?=\s*\}))?/g, ";\n"),
+    INCOMPLETE_TYPENAME,
+    "ERROR"
+);
 
-const longTypeNameCache = new WeakMap<ts.Type, string>();
-function getLongTypeName(typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node): string {
-    let longTypeName = longTypeNameCache.get(type);
-    if (longTypeName !== undefined) return longTypeName;
-    queueWork(() => {
-        longTypeNameCache.set(type, typeChecker.typeToString(
-            type,
-            enclosingDeclaration, 
-            ts.TypeFormatFlags.UseFullyQualifiedType |
-            ts.TypeFormatFlags.NoTruncation |
-            ts.TypeFormatFlags.UseStructuralFallback |
-            ts.TypeFormatFlags.AllowUniqueESSymbolType |
-            ts.TypeFormatFlags.WriteArrowStyleSignature |
-            ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
-        ).replace(/;(\s(?=\s*\}))?/g, ";\n"));
-    });
-    return INCOMPLETE_TYPENAME;
-}
 
+function isUpToDate(
+    context: ServiceContext,
+    fileName: string
+): boolean {
+    const committedFile = context.getCommittedSourceFilesCache().get(fileName);
+    const currentFile = context.sourceFilesCache.get(fileName)
+    return committedFile === currentFile;
+}
 
 function getDecorations(
     context: ServiceContext,
@@ -192,7 +228,7 @@ function getDecorations(
     function aux(node: ts.Node): void {
         node.forEachChild(aux);
 
-        if(skipTypes.has(node)) return;
+        if (skipTypes.has(node)) return;
 
         try {
             if (ts.isVariableDeclaration(node) && !node.type) {
@@ -208,20 +244,20 @@ function getDecorations(
             } else if (ts.isParameter(node) && !node.type && context.configuration.features.functionParameterType) {
                 result.push(getDecoration(sourceFile!, typeChecker, configuration, node.name))
             } else if (ts.isFunctionDeclaration(node) && !node.type && context.configuration.features.functionReturnType) {
-                const signature = typeChecker.getSignatureFromDeclaration(node);
-                result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.body, signature && signature.getReturnType(), false, false));
+                const signature = getSignatureFromDeclaration(typeChecker, node);
+                result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.body, signature && getReturnType(typeChecker, signature), false, false));
             } else if (ts.isMethodDeclaration(node) && !node.type && context.configuration.features.functionReturnType) {
-                const signature = typeChecker.getSignatureFromDeclaration(node);
-                result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.body, signature && signature.getReturnType(), false, false));
+                const signature = getSignatureFromDeclaration(typeChecker, node);
+                result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.body, signature && getReturnType(typeChecker, signature), false, false));
             } else if (ts.isArrowFunction(node) && !node.type && context.configuration.features.functionReturnType) {
-                const signature = typeChecker.getSignatureFromDeclaration(node);
+                const signature = getSignatureFromDeclaration(typeChecker, node);
                 const returnsFunction = ts.isFunctionLike(node.body);
                 if (!returnsFunction) {
-                    result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.equalsGreaterThanToken, signature && signature.getReturnType(), node.parameters.length === 1, false));
+                    result.push(getDecoration(sourceFile!, typeChecker, configuration, node, node.equalsGreaterThanToken, signature && getReturnType(typeChecker, signature), node.parameters.length === 1, false));
                 }
             } else if (ts.isObjectBindingPattern(node) && context.configuration.features.objectPatternType) {
                 node.forEachChild(child => {
-                    if(skipTypes.has(child)) return;
+                    if (skipTypes.has(child)) return;
                     if (ts.isBindingElement(child)) {
                         result.push(getDecoration(sourceFile!, typeChecker, configuration, child));
                     }
@@ -229,7 +265,7 @@ function getDecorations(
                 if (node.parent) skipTypes.add(node.parent);
             } else if (ts.isArrayBindingPattern(node) && context.configuration.features.arrayPatternType) {
                 node.forEachChild(child => {
-                    if(skipTypes.has(child)) return;
+                    if (skipTypes.has(child)) return;
                     if (ts.isBindingElement(child)) {
                         result.push(getDecoration(sourceFile!, typeChecker, configuration, child));
                     }
@@ -241,56 +277,83 @@ function getDecorations(
                     current = current.parent;
                 if (current && ts.isReturnStatement(current))
                     current = current.parent;
-                while(current && (
+                while (current && (
                     ts.isBlock(current) ||
                     ts.isIfStatement(current)
                 )) current = current.parent;
-                if (current &&  ts.isFunctionLike(current)) {
+                if (current && ts.isFunctionLike(current)) {
                     const signature = typeChecker.getSignatureFromDeclaration(current);
-                    if(signature) {
-                        const returnObject = signature.getReturnType();
-                        let numberOfTypes = 0;
-                        node.forEachChild(child => {
-                            if ((
-                                ts.isPropertyAssignment(child) ||
-                                ts.isShorthandPropertyAssignment(child)
-                             ) && ts.isIdentifier(child.name)) {
-                                const symbol = returnObject.getProperty(child.name.text);
-                                if (symbol && symbol.valueDeclaration) {
-                                    numberOfTypes++;
-                                    const type = getTypeAtLocation(typeChecker, symbol.valueDeclaration);
-                                    if (type) {
-                                        result.push(getDecoration(sourceFile!, typeChecker, configuration, child.name, undefined, type));
+                    if (signature) {
+                        const returnObject = getReturnType(typeChecker, signature);
+                        if (returnObject === INCOMPLETE_TYPE) {
+                            const startPosition = sourceFile!.getLineAndCharacterOfPosition(node.pos + node.getLeadingTriviaWidth());
+                            const endPosition = sourceFile!.getLineAndCharacterOfPosition(node.end);
+                            result.push({
+                                textBefore: '',
+                                textAfter: ': ...',
+                                startPosition,
+                                endPosition,
+                                isWarning: false,
+                                isIncomplete: true
+                            });
+                        } else if (returnObject) {
+                            let numberOfTypes = 0;
+                            node.forEachChild(child => {
+                                if ((
+                                    ts.isPropertyAssignment(child) ||
+                                    ts.isShorthandPropertyAssignment(child)
+                                ) && ts.isIdentifier(child.name)) {
+                                    const symbol = returnObject.getProperty(child.name.text);
+                                    if (symbol && symbol.valueDeclaration) {
+                                        numberOfTypes++;
+                                        const type = getTypeAtLocation(typeChecker, symbol.valueDeclaration);
+                                        if (type) {
+                                            result.push(getDecoration(sourceFile!, typeChecker, configuration, child.name, undefined, type));
+                                        }
                                     }
                                 }
-                            }
-                        });
-                        if (current && numberOfTypes > 0 && numberOfTypes === returnObject.getProperties().length) skipTypes.add(current);
+                            });
+                            if (current && numberOfTypes > 0 && numberOfTypes === returnObject.getProperties().length) skipTypes.add(current);
+                        }
                     }
                 }
             } else if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.arguments && node.arguments.length > 0 && context.configuration.features.parameterName) {
-                const resolvedSignature = typeChecker.getResolvedSignature(node);
+                const resolvedSignature = getResolvedSignature(typeChecker, node);
+
                 if (resolvedSignature) {
                     for (let i = 0; i < node.arguments.length; ++i) {
                         const argument = node.arguments[i];
-                        const parameter = resolvedSignature.parameters[i];
-                        if (parameter) {
-                            const parameterName = (isRestParameter(parameter) ? '...' : '') + parameter.name;
-                            if (parameterName !== argument.getText()) {
-                                result.push({
-                                    textBefore: `${parameterName}: `,
-                                    textAfter: '',
-                                    startPosition: sourceFile!.getLineAndCharacterOfPosition(argument.pos + argument.getLeadingTriviaWidth()),
-                                    endPosition: sourceFile!.getLineAndCharacterOfPosition(argument.end),
-                                    isWarning: false,
-                                    isIncomplete: false
-                                });
+                        const startPosition = sourceFile!.getLineAndCharacterOfPosition(argument.pos + argument.getLeadingTriviaWidth());
+                        const endPosition = sourceFile!.getLineAndCharacterOfPosition(argument.end);
+                        if (resolvedSignature === INCOMPLETE_SIGNATURE) {
+                            result.push({
+                                textBefore: '...: ',
+                                textAfter: '',
+                                startPosition,
+                                endPosition,
+                                isWarning: false,
+                                isIncomplete: true
+                            });
+                        } else {
+                            const parameter = resolvedSignature.parameters[i];
+                            if (parameter) {
+                                const parameterName = (isRestParameter(parameter) ? '...' : '') + parameter.name;
+                                if (parameterName !== argument.getText()) {
+                                    result.push({
+                                        textBefore: `${parameterName}: `,
+                                        textAfter: '',
+                                        startPosition,
+                                        endPosition,
+                                        isWarning: false,
+                                        isIncomplete: false
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
-        } catch(e) {
+        } catch (e) {
             logError(e.message);
         }
     }
@@ -302,7 +365,7 @@ function getDecoration(
     configuration: Configuration,
     node: ts.Node,
     endNode: ts.Node | undefined = undefined,
-    type: ts.Type = getTypeAtLocation(typeChecker, node),
+    type: ts.Type | null | typeof INCOMPLETE_TYPE = getTypeAtLocation(typeChecker, node),
     wrap: boolean = false,
     hover: boolean = true
 ): Decoration {
@@ -313,7 +376,10 @@ function getDecoration(
     let typeName = INCOMPLETE_TYPENAME;
     let longTypeName = INCOMPLETE_TYPENAME;
 
-    if(type !== INCOMPLETE_TYPE) {
+    if (type === null) {
+        typeName = "???";
+        longTypeName = "???";
+    } else if (type !== INCOMPLETE_TYPE) {
         typeName = getShortTypeName(typeChecker, type, node.parent);
         longTypeName = getLongTypeName(typeChecker, type, node.parent);
     }
@@ -348,7 +414,7 @@ function notifyDocumentChange(
             context.sourceFilesCache.set(fileName, newSourceFile);
             context.updateProgram();
         }
-    } catch(e) {
+    } catch (e) {
         logError(e.message);
         context.sourceFilesCache.delete(fileName);
         context.updateProgram();
@@ -362,12 +428,12 @@ function notifyFileChange(
 ): void {
     switch (fileChangeType) {
         case FileChangeTypes.Created:
-            const isNewRootFile = getParsedCommandLine(context.rootPath).fileNames.some(rootFile => rootFile === fileName);
+            const isNewRootFile = context.getParsedCommandLine().fileNames.some(rootFile => rootFile === fileName);
             if (isNewRootFile) {
-                context.updateProgram();
+                context.updateParsedCommandLine();
             }
             break;
-        
+
         case FileChangeTypes.Deleted:
             const wasSourceFile = context.getRootFileNames().some(rootFile => rootFile === fileName);
             if (wasSourceFile) {
@@ -380,6 +446,9 @@ function notifyFileChange(
             const isSourceFile = context.getRootFileNames().some(rootFile => rootFile === fileName);
             if (isSourceFile) {
                 updateCachedSourceFile(context, fileName);
+            }
+            if (fileName.endsWith("tsconfig.json")) {
+                context.updateParsedCommandLine();
             }
             break;
 

@@ -93,17 +93,16 @@
           "default": true,
           "description": "Render an inferred 'any' type with a warning color."
         },
+        "inlineTypes.features.showIncompleteInfo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Render a '...' during type computation."
+        },
         "inlineTypes.updateDelay": {
           "type": "integer",
           "default": 50,
           "minimum": 0,
           "description": "A delay for propagating decoration updates to the editor in milliseconds."
-        },
-        "inlineTypes.compileDelay": {
-          "type": "integer",
-          "default": 50,
-          "minimum": 0,
-          "description": "A delay for propagating document updates to the typescript compiler in milliseconds."
         },
         "inlineTypes.lightThemeDecorationStyle.opacity": {
           "type": "number",

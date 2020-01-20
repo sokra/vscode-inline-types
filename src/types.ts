@@ -32,6 +32,7 @@ export interface Service {
     notifyDocumentChange(fileName: string, textChanges: ReadonlyArray<TextChange>): void;
     notifyFileChange(fileName: string, fileChangeType: FileChangeType): void;
     getDecorations(fileName: string): ReadonlyArray<Decoration>;
+    isUpToDate(fileName: string): boolean;
 }
 
 export type FeatureType =
@@ -45,6 +46,7 @@ export type FeatureType =
     | 'objectLiteralType'
     | 'parameterName'
     | 'highlightAny'
+    | 'showIncompleteInfo'
 
 export interface Configuration {
     readonly features: { readonly [P in FeatureType]: boolean };
