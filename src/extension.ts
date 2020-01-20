@@ -61,6 +61,7 @@ function mapConfiguration(configuration: vscode.WorkspaceConfiguration): Configu
     return {
         features: configuration.features,
         updateDelay: configuration.updateDelay,
+        compileDelay: configuration.compileDelay,
         lightThemeDecorationStyle: configuration.lightThemeDecorationStyle,
         darkThemeDecorationStyle: configuration.darkThemeDecorationStyle
     };
@@ -71,12 +72,17 @@ function updateDecorations(
     service: Service,
     configuration: Configuration
 ): void {
+    let isIncomplete = false;
     const visibleTextEditors = vscode.window.visibleTextEditors.filter(isSupportedLanguage);
     for (const visibleTextEditor of visibleTextEditors) {
         const fileName = visibleTextEditor.document.fileName;
         const decorations = service.getDecorations(normalizeFileName(fileName));
+         isIncomplete = isIncomplete || decorations.some(d => d.isIncomplete)
         const decorationOptions = decorations.reduce<vscode.DecorationOptions[]>((arr, d) => arr.concat(createDecorationOptions(d, configuration)), []);
         visibleTextEditor.setDecorations(decorationType, decorationOptions);
+    }
+    if(isIncomplete) {
+        setTimeout(() => updateDecorations(decorationType, service, configuration), configuration.updateDelay);
     }
 }
 

@@ -12,6 +12,7 @@ export interface Decoration {
     readonly startPosition: Position;
     readonly endPosition: Position;
     readonly isWarning: boolean;
+    readonly isIncomplete: boolean;
 }
 
 export interface TextChange {
@@ -48,6 +49,7 @@ export type FeatureType =
 export interface Configuration {
     readonly features: { readonly [P in FeatureType]: boolean };
     readonly updateDelay: number;
+    readonly compileDelay: number;
     readonly lightThemeDecorationStyle: DecorationStyle;
     readonly darkThemeDecorationStyle: DecorationStyle;
 }

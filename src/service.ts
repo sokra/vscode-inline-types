@@ -6,17 +6,12 @@ import { throwError, isUndefined, assertNever, curry, isRestParameter } from './
 import { error as logError } from './log';
 import { TextChange, Service, FileChangeType, FileChangeTypes, Decoration, Position, Configuration } from './types';
 
-class SourceFilesCache extends Map<string, ts.SourceFile> {
-    public constructor() {
-        super();
-    }
-}
-
 interface ServiceContext {
     readonly rootPath: string;
     readonly configuration: Configuration;
-    readonly sourceFilesCache: SourceFilesCache;
+    readonly sourceFilesCache: Map<string, ts.SourceFile>;
     readonly updateProgram: () => void;
+    readonly getCommittedSourceFilesCache: () => Map<string, ts.SourceFile>;
     readonly getProgram: () => ts.Program;
     readonly getOptions: () => ts.CompilerOptions;
     readonly getTypeChecker: () => ts.TypeChecker;
@@ -58,13 +53,22 @@ function createServiceContext(
     configuration: Configuration,
     onUpdate: () => void
 ): ServiceContext {
-    const sourceFilesCache = new SourceFilesCache();
-    let program: ts.Program = createProgram(rootPath, sourceFilesCache);
+    const sourceFilesCache = new Map<string, ts.SourceFile>();
+    let committedSourceFilesCache = new Map<string, ts.SourceFile>();
+    let program: ts.Program = createProgram(rootPath, committedSourceFilesCache, sourceFilesCache);
     const context: ServiceContext = {
         rootPath,
         configuration,
         sourceFilesCache,
-        updateProgram: () => updateProgram(() => context, newProgram => program = newProgram, onUpdate),
+        updateProgram: getDelayedOnUpdate(
+            configuration.compileDelay, 
+            () => {
+                ts.createSourceFile
+                committedSourceFilesCache = new Map<string, ts.SourceFile>(context.sourceFilesCache);
+                updateProgram(() => context, newProgram => program = newProgram, onUpdate);
+            }
+        ),
+        getCommittedSourceFilesCache: () => committedSourceFilesCache,
         getProgram: () => program,
         getOptions: () => program.getCompilerOptions(),
         getTypeChecker: () => program.getTypeChecker(),
@@ -73,9 +77,9 @@ function createServiceContext(
     return context;
 }
 
-function createProgram(rootPath: string, sourceFilesCache: SourceFilesCache, oldProgram?: ts.Program): ts.Program {
+function createProgram(rootPath: string, committedSourceFilesCache: Map<string, ts.SourceFile>, sourceFilesCache: Map<string, ts.SourceFile>, oldProgram?: ts.Program): ts.Program {
     const { fileNames, options } = getParsedCommandLine(rootPath);
-    const compilerHost = createCompilerHost(options, sourceFilesCache);
+    const compilerHost = createCompilerHost(options, committedSourceFilesCache, sourceFilesCache);
     const program = ts.createProgram(fileNames, options, compilerHost, oldProgram);
     return program;
 }
@@ -86,16 +90,93 @@ function updateProgram(
     onUpdate: () => void
 ): void {
     const context = getContext();
-    const program = createProgram(context.rootPath, context.sourceFilesCache, context.getProgram());
+    const program = createProgram(context.rootPath, context.getCommittedSourceFilesCache(), context.sourceFilesCache, context.getProgram());
     setProgram(program);
     onUpdate();
 }
+
+let queue: Set<() => void> | undefined = undefined;
+function queueWork(fn: () => void): void {
+    if(queue === undefined) {
+        queue = new Set([fn]);
+        processQueue();
+    } else {
+        queue.add(fn);
+    }
+}
+
+function processQueue(): void {
+    setTimeout(() => {
+        if(queue === undefined) return;
+        if(queue.size === 0) {
+            queue = undefined;
+            return;
+        }
+        const start = Date.now();
+        for(const item of queue) {
+            item();
+            queue.delete(item);
+            if(Date.now() - start > 100) {
+                break;
+            }
+        }
+        processQueue();
+    }, 0);
+}
+
+const INCOMPLETE_TYPE = Symbol("incomplete") as unknown as ts.Type;
+const INCOMPLETE_TYPENAME = "...";
+
+const typeAtLocationCache = new WeakMap<ts.Node, ts.Type>();
+function getTypeAtLocation(typeChecker: ts.TypeChecker, node: ts.Node): ts.Type {
+    const cacheEntry = typeAtLocationCache.get(node);
+    if(cacheEntry !== undefined) return cacheEntry;
+    queueWork(() => {
+        typeAtLocationCache.set(node, typeChecker.getTypeAtLocation(node));
+    });
+    return INCOMPLETE_TYPE;
+}
+
+const typeNameCache = new WeakMap<ts.Type, string>();
+function getShortTypeName(typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node): string {
+    let typeName = typeNameCache.get(type);
+    if (typeName !== undefined) return typeName;
+    queueWork(() => {
+        typeNameCache.set(type, typeChecker.typeToString(
+            type,
+            enclosingDeclaration,
+            ts.TypeFormatFlags.WriteArrowStyleSignature |
+            ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope
+        ));
+    });
+    return INCOMPLETE_TYPENAME;
+}
+
+const longTypeNameCache = new WeakMap<ts.Type, string>();
+function getLongTypeName(typeChecker: ts.TypeChecker, type: ts.Type, enclosingDeclaration?: ts.Node): string {
+    let longTypeName = longTypeNameCache.get(type);
+    if (longTypeName !== undefined) return longTypeName;
+    queueWork(() => {
+        longTypeNameCache.set(type, typeChecker.typeToString(
+            type,
+            enclosingDeclaration, 
+            ts.TypeFormatFlags.UseFullyQualifiedType |
+            ts.TypeFormatFlags.NoTruncation |
+            ts.TypeFormatFlags.UseStructuralFallback |
+            ts.TypeFormatFlags.AllowUniqueESSymbolType |
+            ts.TypeFormatFlags.WriteArrowStyleSignature |
+            ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
+        ).replace(/;(\s(?=\s*\}))?/g, ";\n"));
+    });
+    return INCOMPLETE_TYPENAME;
+}
+
 
 function getDecorations(
     context: ServiceContext,
     fileName: string
 ): ReadonlyArray<Decoration> {
-    const sourceFile = context.sourceFilesCache.get(fileName);
+    const sourceFile = context.getCommittedSourceFilesCache().get(fileName);
     if (!sourceFile) {
         logError(`Failed to find source file '${fileName}' in cache.`);
         return [];
@@ -177,7 +258,7 @@ function getDecorations(
                                 const symbol = returnObject.getProperty(child.name.text);
                                 if (symbol && symbol.valueDeclaration) {
                                     numberOfTypes++;
-                                    const type = typeChecker.getTypeAtLocation(symbol.valueDeclaration);
+                                    const type = getTypeAtLocation(typeChecker, symbol.valueDeclaration);
                                     if (type) {
                                         result.push(getDecoration(sourceFile!, typeChecker, configuration, child.name, undefined, type));
                                     }
@@ -201,7 +282,8 @@ function getDecorations(
                                     textAfter: '',
                                     startPosition: sourceFile!.getLineAndCharacterOfPosition(argument.pos + argument.getLeadingTriviaWidth()),
                                     endPosition: sourceFile!.getLineAndCharacterOfPosition(argument.end),
-                                    isWarning: false
+                                    isWarning: false,
+                                    isIncomplete: false
                                 });
                             }
                         }
@@ -214,44 +296,27 @@ function getDecorations(
     }
 }
 
-const typeNameCache = new WeakMap<ts.Type, string>();
-const longTypeNameCache = new WeakMap<ts.Type, string>();
-
 function getDecoration(
     sourceFile: ts.SourceFile,
     typeChecker: ts.TypeChecker,
     configuration: Configuration,
     node: ts.Node,
     endNode: ts.Node | undefined = undefined,
-    type: ts.Type = typeChecker.getTypeAtLocation(node),
+    type: ts.Type = getTypeAtLocation(typeChecker, node),
     wrap: boolean = false,
     hover: boolean = true
 ): Decoration {
-    let typeName = typeNameCache.get(type);
-    if (typeName === undefined) {
-        typeName = typeChecker.typeToString(
-            type,
-            node.parent,
-            ts.TypeFormatFlags.WriteArrowStyleSignature |
-            ts.TypeFormatFlags.UseAliasDefinedOutsideCurrentScope
-        );
-        typeNameCache.set(type, typeName);
-    }
-    let longTypeName = longTypeNameCache.get(type);
-    if (longTypeName === undefined) {
-        longTypeName = typeChecker.typeToString(
-            type,
-            node.parent, 
-            ts.TypeFormatFlags.UseFullyQualifiedType |
-            ts.TypeFormatFlags.NoTruncation |
-            ts.TypeFormatFlags.UseStructuralFallback |
-            ts.TypeFormatFlags.AllowUniqueESSymbolType |
-            ts.TypeFormatFlags.WriteArrowStyleSignature |
-            ts.TypeFormatFlags.WriteTypeArgumentsOfSignature
-        ).replace(/;(\s(?=\s*\}))?/g, ";\n");
-        longTypeNameCache.set(type, longTypeName);
-    }
     const leadingTriviaWidth = node.getLeadingTriviaWidth();
+    const startPosition = sourceFile.getLineAndCharacterOfPosition(node.pos + leadingTriviaWidth);
+    const endPosition = sourceFile.getLineAndCharacterOfPosition(endNode ? endNode.pos : node.end);
+
+    let typeName = INCOMPLETE_TYPENAME;
+    let longTypeName = INCOMPLETE_TYPENAME;
+
+    if(type !== INCOMPLETE_TYPE) {
+        typeName = getShortTypeName(typeChecker, type, node.parent);
+        longTypeName = getLongTypeName(typeChecker, type, node.parent);
+    }
 
     const textBefore = wrap ? '(' : '';
     const textAfter = (wrap ? ')' : '') + ': ' + typeName;
@@ -260,11 +325,10 @@ function getDecoration(
         hoverMessage = new vscode.MarkdownString();
         hoverMessage.appendCodeblock(longTypeName, "typescript");
     }
-    const startPosition = sourceFile.getLineAndCharacterOfPosition(node.pos + leadingTriviaWidth);
-    const endPosition = sourceFile.getLineAndCharacterOfPosition(endNode ? endNode.pos : node.end);
     const isWarning = configuration.features.highlightAny && /\bany\b/.test(typeName);
+    const isIncomplete = typeName === INCOMPLETE_TYPENAME || longTypeName === INCOMPLETE_TYPENAME;
 
-    return { textBefore, textAfter, hoverMessage, startPosition, endPosition, isWarning };
+    return { textBefore, textAfter, hoverMessage, startPosition, endPosition, isWarning, isIncomplete };
 }
 
 function notifyDocumentChange(
@@ -356,13 +420,14 @@ function getSourceFile(
     languageVersion: ts.ScriptTarget,
     shouldCreateNewSourceFile: boolean | undefined,
     options: ts.CompilerOptions,
-    sourceFilesCache: SourceFilesCache
+    committedSourceFilesCache: Map<string, ts.SourceFile>,
+    sourceFilesCache: Map<string, ts.SourceFile>
 ): ts.SourceFile | undefined {
     if (fileName === ts.getDefaultLibFileName(options)) {
         fileName = ts.getDefaultLibFilePath(options);
     }
 
-    const cachedSourceFile = shouldCreateNewSourceFile ? undefined : sourceFilesCache.get(fileName);
+    const cachedSourceFile = shouldCreateNewSourceFile ? undefined : committedSourceFilesCache.get(fileName);
     if (cachedSourceFile) {
         return cachedSourceFile;
     }
@@ -374,16 +439,17 @@ function getSourceFile(
     }
 
     const sourceFile = ts.createSourceFile(fileName, fileContent, languageVersion);
+    committedSourceFilesCache.set(fileName, sourceFile);
     sourceFilesCache.set(fileName, sourceFile);
     return sourceFile;
 }
 
-function createCompilerHost(options: ts.CompilerOptions, sourceFilesCache: SourceFilesCache): ts.CompilerHost {
+function createCompilerHost(options: ts.CompilerOptions, committedSourceFilesCache: Map<string, ts.SourceFile>, sourceFilesCache: Map<string, ts.SourceFile>): ts.CompilerHost {
     const defaultCompilerHost = ts.createCompilerHost(options);
     return {
         ...defaultCompilerHost,
         getSourceFile: (fileName, languageVersion, _, shouldCreateNewSourceFile) =>
-            getSourceFile(fileName, languageVersion, shouldCreateNewSourceFile, options, sourceFilesCache)
+            getSourceFile(fileName, languageVersion, shouldCreateNewSourceFile, options, committedSourceFilesCache, sourceFilesCache)
     };
 }
 
